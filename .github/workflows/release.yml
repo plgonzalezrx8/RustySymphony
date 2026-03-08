@@ -70,12 +70,24 @@ jobs:
       - name: Build the release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Verify release binary is present and executable
+        run: |
+          binary_path="target/${{ matrix.target }}/release/symphony"
+          test -f "${binary_path}"
+          test -x "${binary_path}"
+
       - name: Package the release archive
         run: |
           mkdir -p dist
           tar -czf "dist/symphony-${{ matrix.target }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" \
             symphony
+
+      - name: Validate packaged archive contents
+        run: |
+          archive_path="dist/symphony-${{ matrix.target }}.tar.gz"
+          tar -tzf "${archive_path}" >/tmp/archive-contents.txt
+          grep -Fx "symphony" /tmp/archive-contents.txt
 
       - name: Attest the build provenance
         uses: actions/attest-build-provenance@v3
@@ -103,6 +115,18 @@ jobs:
       - name: Generate release checksums
         working-directory: dist
         run: shasum -a 256 symphony-*.tar.gz > SHA256SUMS.txt
+
+      - name: Verify checksum coverage for all archives
+        working-directory: dist
+        run: |
+          archive_count="$(ls -1 symphony-*.tar.gz | wc -l | xargs)"
+          checksum_count="$(grep -c "symphony-.*\\.tar\\.gz" SHA256SUMS.txt || true)"
+          test "${archive_count}" -gt 0
+          test "${archive_count}" -eq "${checksum_count}"
+
+      - name: Verify checksums
+        working-directory: dist
+        run: shasum -a 256 -c SHA256SUMS.txt
 
       - name: Publish the GitHub release
         env:

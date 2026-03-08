@@ -46,22 +46,15 @@ jobs:
     outputs:
       can_run: ${{ steps.gate.outputs.can_run }}
       project_slug: ${{ steps.gate.outputs.project_slug }}
+      reason: ${{ steps.gate.outputs.reason }}
     steps:
       - name: Decide whether live smoke tests can run
         id: gate
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          PROJECT_SLUG_FROM_VAR: ${{ vars.SYMPHONY_LINEAR_PROJECT_SLUG }}
-          PROJECT_SLUG_FROM_SECRET: ${{ secrets.SYMPHONY_LINEAR_PROJECT_SLUG }}
-        run: |
-          project_slug="${PROJECT_SLUG_FROM_VAR:-${PROJECT_SLUG_FROM_SECRET:-}}"
-          if [[ -n "${LINEAR_API_KEY}" && -n "${project_slug}" ]]; then
-            echo "can_run=true" >> "$GITHUB_OUTPUT"
-            echo "project_slug=${project_slug}" >> "$GITHUB_OUTPUT"
-          else
-            echo "can_run=false" >> "$GITHUB_OUTPUT"
-            echo "project_slug=" >> "$GITHUB_OUTPUT"
-          fi
+        uses: ./.github/actions/real-integration-gate
+        with:
+          linear_api_key: ${{ secrets.LINEAR_API_KEY }}
+          project_slug_from_var: ${{ vars.SYMPHONY_LINEAR_PROJECT_SLUG }}
+          project_slug_from_secret: ${{ secrets.SYMPHONY_LINEAR_PROJECT_SLUG }}
 
   real-integration:
     name: real-integration
@@ -102,6 +95,9 @@ jobs:
         if: ${{ steps.codex.outputs.available == 'true' }}
         run: cargo test --locked --test real_integration codex_cli_schema_generation_smoke -- --ignored --exact --nocapture
 
+      - name: Run the heavy orchestrator retry churn test
+        run: cargo test --locked --lib orchestrator_heavy_retry_reschedule_churn -- --ignored --nocapture
+
   real-integration-skip:
     name: real-integration-skip
     runs-on: ubuntu-24.04
@@ -109,4 +105,4 @@ jobs:
     if: ${{ needs.prepare-real-integration.outputs.can_run != 'true' }}
     steps:
       - name: Explain why live smoke tests were skipped
-        run: echo "::notice::Skipping live integration smoke tests because LINEAR_API_KEY or SYMPHONY_LINEAR_PROJECT_SLUG is not configured."
+        run: echo "::notice::Skipping live integration smoke tests: ${{ needs.prepare-real-integration.outputs.reason }}."

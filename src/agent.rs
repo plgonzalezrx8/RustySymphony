@@ -1071,6 +1071,7 @@ fn extract_token_usage(value: &Value) -> Option<TokenUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_linear_graphql_arguments_from_string_and_object() {
@@ -1162,5 +1163,38 @@ mod tests {
         }))
         .expect("camelCase tokens should parse");
         assert_eq!(tokens.total_tokens, 13);
+    }
+
+    proptest! {
+        #[test]
+        fn parse_linear_graphql_arguments_round_trips_valid_object_payloads(
+            query in "[A-Za-z0-9 _{}()]{1,80}",
+            key in "[a-z]{1,10}",
+            value in any::<i64>(),
+        ) {
+            let payload = serde_json::json!({
+                "query": query.clone(),
+                "variables": { key.clone(): value }
+            });
+
+            let (parsed_query, variables) =
+                parse_linear_graphql_arguments(Some(&payload)).expect("valid payload should parse");
+            prop_assert_eq!(parsed_query, query);
+            prop_assert_eq!(variables, Some(serde_json::json!({ key: value })));
+        }
+
+        #[test]
+        fn parse_linear_graphql_arguments_rejects_non_object_variables(
+            query in "[A-Za-z0-9 _{}()]{1,80}",
+            first in any::<i64>(),
+            second in any::<i64>(),
+        ) {
+            let payload = serde_json::json!({
+                "query": query,
+                "variables": [first, second]
+            });
+            let error = parse_linear_graphql_arguments(Some(&payload)).unwrap_err();
+            prop_assert!(matches!(error, SymphonyError::InvalidConfig(_)));
+        }
     }
 }

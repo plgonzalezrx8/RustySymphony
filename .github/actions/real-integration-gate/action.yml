@@ -1,0 +1,56 @@
+name: "Real integration gate"
+description: "Compute whether live integration lanes can run and emit normalized outputs."
+inputs:
+  linear_api_key:
+    description: "Linear API key secret value."
+    required: false
+    default: ""
+  project_slug_from_var:
+    description: "Project slug from repository variable."
+    required: false
+    default: ""
+  project_slug_from_secret:
+    description: "Project slug fallback from repository secret."
+    required: false
+    default: ""
+outputs:
+  can_run:
+    description: "true when required secrets/vars are present."
+    value: ${{ steps.gate.outputs.can_run }}
+  project_slug:
+    description: "Normalized project slug used by the live test lane."
+    value: ${{ steps.gate.outputs.project_slug }}
+  reason:
+    description: "Human-readable reason when the lane is skipped."
+    value: ${{ steps.gate.outputs.reason }}
+runs:
+  using: "composite"
+  steps:
+    - id: gate
+      shell: bash
+      env:
+        LINEAR_API_KEY: ${{ inputs.linear_api_key }}
+        PROJECT_SLUG_FROM_VAR: ${{ inputs.project_slug_from_var }}
+        PROJECT_SLUG_FROM_SECRET: ${{ inputs.project_slug_from_secret }}
+      run: |
+        project_slug="${PROJECT_SLUG_FROM_VAR:-${PROJECT_SLUG_FROM_SECRET:-}}"
+        # Normalize whitespace so downstream jobs receive a stable slug value.
+        project_slug="$(printf '%s' "${project_slug}" | xargs)"
+
+        if [[ -n "${LINEAR_API_KEY}" && -n "${project_slug}" ]]; then
+          echo "can_run=true" >> "$GITHUB_OUTPUT"
+          echo "project_slug=${project_slug}" >> "$GITHUB_OUTPUT"
+          echo "reason=ready" >> "$GITHUB_OUTPUT"
+        elif [[ -z "${LINEAR_API_KEY}" && -z "${project_slug}" ]]; then
+          echo "can_run=false" >> "$GITHUB_OUTPUT"
+          echo "project_slug=" >> "$GITHUB_OUTPUT"
+          echo "reason=missing LINEAR_API_KEY and SYMPHONY_LINEAR_PROJECT_SLUG" >> "$GITHUB_OUTPUT"
+        elif [[ -z "${LINEAR_API_KEY}" ]]; then
+          echo "can_run=false" >> "$GITHUB_OUTPUT"
+          echo "project_slug=" >> "$GITHUB_OUTPUT"
+          echo "reason=missing LINEAR_API_KEY" >> "$GITHUB_OUTPUT"
+        else
+          echo "can_run=false" >> "$GITHUB_OUTPUT"
+          echo "project_slug=" >> "$GITHUB_OUTPUT"
+          echo "reason=missing SYMPHONY_LINEAR_PROJECT_SLUG" >> "$GITHUB_OUTPUT"
+        fi

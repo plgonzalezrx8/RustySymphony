@@ -1405,6 +1405,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_retry_due_requeues_when_candidate_state_transitions_to_terminal() {
+        let tracker = ControlledTracker::new(TrackerBehavior {
+            candidates: vec![sample_issue("1", "ABC-1", "Done")],
+            ..TrackerBehavior::default()
+        });
+        let mut state = test_state_with_tracker(Arc::new(tracker));
+        schedule_retry(&mut state, "1", "ABC-1", 1, None, 1);
+
+        handle_retry_due(&mut state, "1").await;
+
+        let retry = state
+            .retry_attempts
+            .get("1")
+            .expect("terminal transitions should be requeued deterministically");
+        assert_eq!(retry.entry.attempt, 2);
+        assert_eq!(
+            retry.entry.error.as_deref(),
+            Some("no available orchestrator slots")
+        );
+        assert!(!state.running.contains_key("1"));
+    }
+
+    #[tokio::test]
+    async fn handle_retry_due_requeues_when_issue_is_marked_for_cancellation() {
+        let tracker = ControlledTracker::new(TrackerBehavior {
+            candidates: vec![sample_issue("1", "ABC-1", "In Progress")],
+            ..TrackerBehavior::default()
+        });
+        let mut state = test_state_with_tracker(Arc::new(tracker));
+        let issue = sample_issue("1", "ABC-1", "In Progress");
+        let (mut running, _) = running_runtime(issue);
+        running.stop_reason = Some(StopReason::Terminal);
+        state.running.insert(String::from("1"), running);
+        schedule_retry(&mut state, "1", "ABC-1", 3, None, 1);
+
+        handle_retry_due(&mut state, "1").await;
+
+        let retry = state
+            .retry_attempts
+            .get("1")
+            .expect("dispatch should not happen while a terminal stop is pending");
+        assert_eq!(retry.entry.attempt, 4);
+        assert_eq!(
+            retry.entry.error.as_deref(),
+            Some("no available orchestrator slots")
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_retry_overwrites_existing_entry_for_same_issue() {
+        let mut state = test_state();
+        schedule_retry(&mut state, "1", "ABC-1", 1, Some(String::from("old")), 10);
+        schedule_retry(&mut state, "1", "ABC-1", 2, Some(String::from("new")), 10);
+
+        assert_eq!(state.retry_attempts.len(), 1);
+        assert_eq!(state.retry_attempts["1"].entry.attempt, 2);
+        assert_eq!(
+            state.retry_attempts["1"].entry.error.as_deref(),
+            Some("new")
+        );
+        assert!(state.claimed.contains("1"));
+    }
+
+    #[tokio::test]
+    async fn reload_workflow_keeps_retry_bookkeeping_intact() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let workflow_path = tempdir.path().join("WORKFLOW.md");
+        unsafe {
+            std::env::set_var("LINEAR_API_KEY", "test-token");
+        }
+        tokio::fs::write(
+            &workflow_path,
+            "---\ntracker:\n  kind: linear\n  project_slug: proj\npolling:\n  interval_ms: 9999\n---\nhello",
+        )
+        .await
+        .expect("workflow should be written");
+
+        let mut state = test_state();
+        schedule_retry(&mut state, "1", "ABC-1", 1, None, 10);
+        reload_workflow(&mut state, &workflow_path).await;
+
+        assert!(state.retry_attempts.contains_key("1"));
+        assert!(state.claimed.contains("1"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn orchestrator_heavy_retry_reschedule_churn() {
+        let mut state = test_state();
+        // Stress retry rescheduling deterministically without invoking external services.
+        for attempt in 1..=200 {
+            schedule_retry(
+                &mut state,
+                "1",
+                "ABC-1",
+                attempt,
+                Some(format!("attempt-{attempt}")),
+                1,
+            );
+        }
+
+        assert_eq!(state.retry_attempts.len(), 1);
+        assert_eq!(state.retry_attempts["1"].entry.attempt, 200);
+        assert_eq!(
+            state.retry_attempts["1"].entry.error.as_deref(),
+            Some("attempt-200")
+        );
+    }
+
+    #[tokio::test]
     async fn build_and_publish_snapshots_include_running_and_retry_entries() {
         let mut state = test_state();
         let issue = sample_issue("1", "ABC-1", "In Progress");
