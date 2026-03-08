@@ -559,6 +559,7 @@ fn json_to_liquid(value: &Value) -> Result<liquid::model::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_workflow_without_front_matter() {
@@ -710,5 +711,36 @@ mod tests {
         }))
         .expect("nested json should convert");
         assert!(matches!(liquid, liquid::model::Value::Object(_)));
+    }
+
+    proptest! {
+        #[test]
+        fn rejects_scalar_front_matter(value in prop_oneof![
+            any::<i64>().prop_map(|value| value.to_string()),
+            any::<bool>().prop_map(|value| value.to_string()),
+        ]) {
+            let content = format!("---\n{value}\n---\nhello");
+            let error = parse_workflow_definition(&content).unwrap_err();
+            prop_assert!(matches!(error, SymphonyError::WorkflowFrontMatterNotAMap));
+        }
+
+        #[test]
+        fn parse_string_list_trims_and_filters_entries(
+            entries in proptest::collection::vec("[A-Za-z0-9 ]{1,10}", 1..8)
+        ) {
+            // Build a deliberately noisy comma-separated string to verify trimming.
+            let raw = entries
+                .iter()
+                .map(|entry| format!(" {} ", entry))
+                .collect::<Vec<_>>()
+                .join(",");
+            let parsed = parse_string_list(Some(StringOrVec::One(raw)), Vec::new());
+            let expected = entries
+                .iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>();
+            prop_assert_eq!(parsed, expected);
+        }
     }
 }
