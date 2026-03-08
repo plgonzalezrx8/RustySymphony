@@ -1,0 +1,87 @@
+name: Deep Validation
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deep-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage-and-integration:
+    name: coverage-and-integration
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain with LLVM tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Restore the Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Run hermetic tests with coverage enforcement
+        run: cargo llvm-cov --workspace --all-features --tests --locked --fail-under-lines 70
+
+  real-integration:
+    name: real-integration
+    runs-on: ubuntu-24.04
+    if: ${{ secrets.LINEAR_API_KEY != '' && (vars.SYMPHONY_LINEAR_PROJECT_SLUG != '' || secrets.SYMPHONY_LINEAR_PROJECT_SLUG != '') }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore the Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the live Linear smoke test
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          SYMPHONY_LINEAR_PROJECT_SLUG: ${{ vars.SYMPHONY_LINEAR_PROJECT_SLUG || secrets.SYMPHONY_LINEAR_PROJECT_SLUG }}
+          SYMPHONY_LINEAR_ENDPOINT: ${{ vars.SYMPHONY_LINEAR_ENDPOINT }}
+        run: cargo test --locked --test real_integration live_linear_candidate_fetch_smoke -- --ignored --exact --nocapture
+
+      - name: Detect Codex CLI availability
+        id: codex
+        run: |
+          if command -v codex >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report skipped Codex smoke coverage
+        if: ${{ steps.codex.outputs.available != 'true' }}
+        run: echo "::notice::Skipping codex_cli_schema_generation_smoke because the Codex CLI is not installed on this runner."
+
+      - name: Run the Codex CLI smoke test
+        if: ${{ steps.codex.outputs.available == 'true' }}
+        run: cargo test --locked --test real_integration codex_cli_schema_generation_smoke -- --ignored --exact --nocapture
+
+  real-integration-skip:
+    name: real-integration-skip
+    runs-on: ubuntu-24.04
+    if: ${{ !(secrets.LINEAR_API_KEY != '' && (vars.SYMPHONY_LINEAR_PROJECT_SLUG != '' || secrets.SYMPHONY_LINEAR_PROJECT_SLUG != '')) }}
+    steps:
+      - name: Explain why live smoke tests were skipped
+        run: echo "::notice::Skipping live integration smoke tests because LINEAR_API_KEY or SYMPHONY_LINEAR_PROJECT_SLUG is not configured."
