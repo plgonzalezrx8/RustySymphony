@@ -46,7 +46,7 @@ Install `cargo-llvm-cov` locally with `cargo install cargo-llvm-cov --locked` if
 
 The repository ships with three GitHub Actions workflows:
 
-- `.github/workflows/ci.yml`: fast required verification for pushes and pull requests. It runs formatting, clippy, tests, and a release-build smoke check.
+- `.github/workflows/ci.yml`: fast required verification for pushes and pull requests. It runs formatting, clippy, tests, a Linux release build smoke check, and a macOS target smoke check.
 - `.github/workflows/deep-validation.yml`: deeper validation for `main`, nightly schedules, and manual runs. It enforces 70% line coverage across the hermetic suite and exposes a secrets-gated live integration lane.
 - `.github/workflows/release.yml`: semver tag releases for `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`, including `SHA256SUMS.txt` and GitHub build provenance attestations.
 

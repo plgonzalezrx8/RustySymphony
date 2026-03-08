@@ -81,5 +81,20 @@ jobs:
       - name: Build the Linux release artifact
         run: cargo build --release --locked
 
+  release-smoke-macos:
+    name: release-smoke-macos
+    runs-on: macos-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Restore the Cargo cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Smoke-check the macOS target
         run: cargo check --locked --target aarch64-apple-darwin

@@ -27,8 +27,6 @@ jobs:
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
 
       - name: Restore the Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -42,10 +40,8 @@ jobs:
       - name: Run the test suite
         run: cargo test --locked
 
-      - name: Smoke-check release builds
-        run: |
-          cargo build --release --locked
-          cargo check --locked --target aarch64-apple-darwin
+      - name: Smoke-check the Linux release build
+        run: cargo build --release --locked
 
   build:
     name: build-${{ matrix.target }}
