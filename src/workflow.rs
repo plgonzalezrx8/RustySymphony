@@ -614,4 +614,101 @@ mod tests {
         let error = renderer.render_issue_prompt(&issue, None).unwrap_err();
         assert!(matches!(error, SymphonyError::TemplateRenderError(_)));
     }
+
+    #[test]
+    fn validates_dispatch_config_and_rejects_missing_fields() {
+        let definition = parse_workflow_definition(
+            "---\ntracker:\n  kind: linear\n  project_slug: proj\ncodex:\n  command: codex app-server\n---\nhello",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("LINEAR_API_KEY", "test-key");
+        }
+        let config = build_effective_config(Path::new("WORKFLOW.md"), &definition).unwrap();
+        validate_dispatch_config(&config).expect("config should validate");
+
+        let mut missing_api_key = config.clone();
+        missing_api_key.tracker.api_key.clear();
+        assert!(matches!(
+            validate_dispatch_config(&missing_api_key),
+            Err(SymphonyError::MissingTrackerApiKey)
+        ));
+
+        let mut missing_project = config.clone();
+        missing_project.tracker.project_slug.clear();
+        assert!(matches!(
+            validate_dispatch_config(&missing_project),
+            Err(SymphonyError::MissingTrackerProjectSlug)
+        ));
+    }
+
+    #[test]
+    fn build_effective_config_applies_defaults_and_normalizes_limits() {
+        unsafe {
+            std::env::set_var("WORKSPACE_ROOT", "/tmp/symphony-tests");
+            std::env::set_var("LINEAR_API_KEY", "test-key");
+        }
+        let definition = parse_workflow_definition(
+            "---\ntracker:\n  kind: linear\n  project_slug: proj\nworkspace:\n  root: $WORKSPACE_ROOT\nhooks:\n  timeout_ms: 0\nagent:\n  max_concurrent_agents_by_state:\n    Todo: 3\n    Bad: 0\n---\nhello",
+        )
+        .unwrap();
+        let config = build_effective_config(Path::new("WORKFLOW.md"), &definition).unwrap();
+
+        assert_eq!(config.workspace.root, PathBuf::from("/tmp/symphony-tests"));
+        assert_eq!(config.hooks.timeout_ms, DEFAULT_HOOK_TIMEOUT_MS);
+        assert_eq!(
+            config.agent.max_concurrent_agents_by_state.get("todo"),
+            Some(&3)
+        );
+        assert!(
+            !config
+                .agent
+                .max_concurrent_agents_by_state
+                .contains_key("bad")
+        );
+        assert_eq!(config.codex.command, "codex app-server");
+    }
+
+    #[test]
+    fn expands_home_and_parses_string_lists() {
+        unsafe {
+            std::env::set_var("HOME", "/tmp/home");
+        }
+        assert_eq!(
+            expand_workspace_root(Some(String::from("~/workspace"))).unwrap(),
+            PathBuf::from("/tmp/home/workspace")
+        );
+        assert_eq!(
+            parse_string_list(
+                Some(StringOrVec::One(String::from("Todo, In Progress , Done"))),
+                Vec::new()
+            ),
+            vec!["Todo", "In Progress", "Done"]
+        );
+    }
+
+    #[test]
+    fn renders_prompt_and_converts_json_to_liquid_values() {
+        let renderer = PromptRenderer::compile(
+            "{{ issue.identifier }} {{ issue.labels[0] }} {{ attempt | default: 0 }}",
+        )
+        .unwrap();
+        let issue = Issue {
+            id: "1".into(),
+            identifier: "ABC-1".into(),
+            title: "Example".into(),
+            labels: vec![String::from("bug")],
+            ..Issue::default()
+        };
+        let prompt = renderer
+            .render_issue_prompt(&issue, Some(2))
+            .expect("prompt should render");
+        assert_eq!(prompt, "ABC-1 bug 2");
+
+        let liquid = json_to_liquid(&serde_json::json!({
+            "nested": ["one", 2, true]
+        }))
+        .expect("nested json should convert");
+        assert!(matches!(liquid, liquid::model::Value::Object(_)));
+    }
 }

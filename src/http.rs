@@ -218,6 +218,10 @@ fn _socket_to_string(address: SocketAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{
+        AttemptDebugInfo, CodexTotals, IssueDebugSnapshot, LogDebugInfo, SnapshotCounts,
+        WorkspaceDebugInfo,
+    };
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
@@ -261,5 +265,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn dashboard_and_issue_routes_render_published_state() {
+        let store = SnapshotStore::new();
+        store
+            .publish(
+                RuntimeSnapshot {
+                    generated_at: chrono::Utc::now(),
+                    counts: SnapshotCounts {
+                        running: 1,
+                        retrying: 0,
+                    },
+                    running: vec![],
+                    retrying: vec![],
+                    codex_totals: CodexTotals::default(),
+                    rate_limits: None,
+                },
+                [(
+                    String::from("ABC-1"),
+                    IssueDebugSnapshot {
+                        issue_identifier: String::from("ABC-1"),
+                        issue_id: String::from("1"),
+                        status: String::from("running"),
+                        workspace: WorkspaceDebugInfo {
+                            path: "/tmp/symphony/ABC-1".into(),
+                        },
+                        attempts: AttemptDebugInfo {
+                            restart_count: 0,
+                            current_retry_attempt: None,
+                        },
+                        running: None,
+                        retry: None,
+                        logs: LogDebugInfo::default(),
+                        recent_events: Vec::new(),
+                        last_error: None,
+                        tracked: Default::default(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .await;
+
+        let (refresh_tx, _refresh_rx) = mpsc::unbounded_channel();
+        let app = build_app_router(store, refresh_tx);
+
+        let dashboard = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(dashboard.status(), StatusCode::OK);
+
+        let missing_issue = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ABC-404")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_issue.status(), StatusCode::NOT_FOUND);
+
+        let wrong_method = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn refresh_endpoint_reports_closed_channels() {
+        let store = SnapshotStore::new();
+        let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
+        drop(refresh_rx);
+        let app = build_app_router(store, refresh_tx);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

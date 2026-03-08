@@ -40,6 +40,8 @@ The dashboard is served on loopback only. The JSON API is available under `/api/
 - `cargo test --locked`
 - `cargo llvm-cov --workspace --all-features --tests --fail-under-lines 70`
 
+Install `cargo-llvm-cov` locally with `cargo install cargo-llvm-cov --locked` if you want to run the deep-validation coverage command outside GitHub Actions.
+
 ## CI and Release
 
 The repository ships with three GitHub Actions workflows:

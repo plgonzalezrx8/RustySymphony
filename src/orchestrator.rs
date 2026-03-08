@@ -858,8 +858,10 @@ fn build_issue_debug_map(state: &OrchestratorState) -> BTreeMap<String, IssueDeb
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SymphonyError;
     use async_trait::async_trait;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
     struct NoopTracker;
@@ -896,7 +898,88 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TrackerBehavior {
+        candidates: Vec<Issue>,
+        candidate_error: Option<String>,
+        issues_by_states: Vec<Issue>,
+        issues_by_states_error: Option<String>,
+        issue_states: Vec<Issue>,
+        issue_states_error: Option<String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct ControlledTracker {
+        behavior: Arc<Mutex<TrackerBehavior>>,
+    }
+
+    impl ControlledTracker {
+        fn new(behavior: TrackerBehavior) -> Self {
+            Self {
+                behavior: Arc::new(Mutex::new(behavior)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IssueTracker for ControlledTracker {
+        async fn fetch_candidate_issues(&self, _config: &EffectiveConfig) -> Result<Vec<Issue>> {
+            let behavior = self.behavior.lock().expect("tracker behavior should lock");
+            if let Some(error) = &behavior.candidate_error {
+                return Err(SymphonyError::LinearApiRequest(error.clone()));
+            }
+            Ok(behavior.candidates.clone())
+        }
+
+        async fn fetch_issues_by_states(
+            &self,
+            _config: &EffectiveConfig,
+            _state_names: &[String],
+        ) -> Result<Vec<Issue>> {
+            let behavior = self.behavior.lock().expect("tracker behavior should lock");
+            if let Some(error) = &behavior.issues_by_states_error {
+                return Err(SymphonyError::LinearApiRequest(error.clone()));
+            }
+            Ok(behavior.issues_by_states.clone())
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            _config: &EffectiveConfig,
+            _issue_ids: &[String],
+        ) -> Result<Vec<Issue>> {
+            let behavior = self.behavior.lock().expect("tracker behavior should lock");
+            if let Some(error) = &behavior.issue_states_error {
+                return Err(SymphonyError::LinearApiRequest(error.clone()));
+            }
+            Ok(behavior.issue_states.clone())
+        }
+
+        async fn execute_raw_graphql(
+            &self,
+            _config: &EffectiveConfig,
+            _query: &str,
+            _variables: Option<Value>,
+        ) -> Result<Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    fn sample_issue(id: &str, identifier: &str, state: &str) -> Issue {
+        Issue {
+            id: id.into(),
+            identifier: identifier.into(),
+            title: format!("Issue {identifier}"),
+            state: state.into(),
+            ..Issue::default()
+        }
+    }
+
     fn test_state() -> OrchestratorState {
+        test_state_with_tracker(Arc::new(NoopTracker))
+    }
+
+    fn test_state_with_tracker(tracker: Arc<dyn IssueTracker>) -> OrchestratorState {
         let config = EffectiveConfig {
             workflow_path: PathBuf::from("WORKFLOW.md"),
             prompt_template: "Hello".into(),
@@ -943,7 +1026,7 @@ mod tests {
         let (retry_tx, _) = mpsc::unbounded_channel();
         OrchestratorState {
             workflow,
-            tracker: Arc::new(NoopTracker),
+            tracker,
             workspace_manager: WorkspaceManager,
             snapshot_store: SnapshotStore::new(),
             worker_tx,
@@ -956,6 +1039,33 @@ mod tests {
             rate_limits: None,
             refresh_queued: false,
         }
+    }
+
+    fn running_runtime(issue: Issue) -> (RunningRuntime, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let worker = WorkerHandle {
+            join: tokio::spawn(async {}),
+            cancel: cancel.clone(),
+        };
+        (
+            RunningRuntime {
+                entry: RunningEntry {
+                    issue_id: issue.id.clone(),
+                    issue_identifier: issue.identifier.clone(),
+                    issue,
+                    workspace_path: PathBuf::from("/tmp/symphony/workspace"),
+                    retry_attempt: None,
+                    started_at: Utc::now() - chrono::Duration::seconds(2),
+                    session: LiveSession::default(),
+                    recent_events: Vec::new(),
+                    last_error: None,
+                    log_path: None,
+                },
+                worker,
+                stop_reason: None,
+            },
+            cancel,
+        )
     }
 
     #[test]
@@ -1069,5 +1179,315 @@ mod tests {
         let running = state.running.get("1").expect("running entry should exist");
         assert_eq!(running.stop_reason, Some(StopReason::Stall));
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn apply_session_update_tracks_tokens_limits_and_recent_events() {
+        let mut state = test_state();
+        let issue = sample_issue("1", "ABC-1", "In Progress");
+        let (running, _) = running_runtime(issue);
+        state.running.insert(String::from("1"), running);
+
+        for index in 0..(RECENT_EVENT_LIMIT + 3) {
+            apply_session_update(
+                &mut state,
+                SessionUpdate {
+                    issue_id: String::from("1"),
+                    issue_identifier: String::from("ABC-1"),
+                    event: if index == 0 {
+                        String::from("turn_failed")
+                    } else {
+                        String::from("notification")
+                    },
+                    message: Some(format!("message-{index}")),
+                    at: Utc::now(),
+                    session_id: Some(String::from("thread-1-turn-1")),
+                    thread_id: Some(String::from("thread-1")),
+                    turn_id: Some(String::from("turn-1")),
+                    pid: Some(String::from("1234")),
+                    absolute_tokens: Some(TokenUsage {
+                        input_tokens: 10 + index as u64,
+                        output_tokens: 5 + index as u64,
+                        total_tokens: 15 + (index as u64 * 2),
+                    }),
+                    rate_limits: Some(serde_json::json!({ "remaining": 42 })),
+                    turn_count: Some(2),
+                },
+            );
+        }
+
+        let running = state.running.get("1").expect("running entry should exist");
+        assert_eq!(
+            running.entry.session.session_id.as_deref(),
+            Some("thread-1-turn-1")
+        );
+        assert_eq!(running.entry.session.turn_count, 2);
+        assert_eq!(running.entry.session.codex_total_tokens, 59);
+        assert_eq!(running.entry.recent_events.len(), RECENT_EVENT_LIMIT);
+        assert_eq!(running.entry.last_error.as_deref(), Some("message-0"));
+        assert_eq!(state.codex_totals.input_tokens, 32);
+        assert_eq!(state.codex_totals.output_tokens, 27);
+        assert_eq!(state.codex_totals.total_tokens, 59);
+        assert_eq!(
+            state.rate_limits,
+            Some(serde_json::json!({ "remaining": 42 }))
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_running_updates_active_and_cancels_terminal_and_non_active() {
+        let tracker = ControlledTracker::new(TrackerBehavior {
+            issue_states: vec![
+                Issue {
+                    title: String::from("Updated"),
+                    ..sample_issue("1", "ABC-1", "In Progress")
+                },
+                sample_issue("2", "ABC-2", "Done"),
+                sample_issue("3", "ABC-3", "Backlog"),
+            ],
+            ..TrackerBehavior::default()
+        });
+        let mut state = test_state_with_tracker(Arc::new(tracker));
+        state.workflow.config.codex.stall_timeout_ms = 60_000;
+
+        let (running_one, _) = running_runtime(sample_issue("1", "ABC-1", "Todo"));
+        let (running_two, cancel_two) = running_runtime(sample_issue("2", "ABC-2", "In Progress"));
+        let (running_three, cancel_three) =
+            running_runtime(sample_issue("3", "ABC-3", "In Progress"));
+        state.running.insert(String::from("1"), running_one);
+        state.running.insert(String::from("2"), running_two);
+        state.running.insert(String::from("3"), running_three);
+
+        reconcile_running_issues(&mut state).await;
+
+        assert_eq!(state.running["1"].entry.issue.title, "Updated");
+        assert_eq!(state.running["2"].stop_reason, Some(StopReason::Terminal));
+        assert_eq!(state.running["3"].stop_reason, Some(StopReason::NonActive));
+        assert!(cancel_two.is_cancelled());
+        assert!(cancel_three.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn handle_worker_finished_cleans_terminal_workspaces_and_releases_claims() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let workspace_root = tempdir.path().join("workspaces");
+        let issue = sample_issue("1", "ABC-1", "Done");
+        let workspace_path = workspace_root.join("ABC-1");
+        tokio::fs::create_dir_all(&workspace_path)
+            .await
+            .expect("workspace should exist");
+
+        let mut state = test_state();
+        state.workflow.config.workspace.root = workspace_root;
+        let (mut running, _) = running_runtime(issue.clone());
+        running.entry.workspace_path = workspace_path.clone();
+        running.stop_reason = Some(StopReason::Terminal);
+        state.claimed.insert(issue.id.clone());
+        state.running.insert(issue.id.clone(), running);
+
+        handle_worker_finished(
+            &mut state,
+            crate::agent::WorkerOutcome {
+                issue: issue.clone(),
+                attempt: None,
+                workspace_path: workspace_path.clone(),
+                workspace_key: String::from("ABC-1"),
+                log_path: workspace_path.join(".symphony/logs/latest.log"),
+                exit: WorkerExit::Succeeded,
+                error: None,
+                turn_count: 1,
+            },
+        )
+        .await;
+
+        assert!(!state.claimed.contains(&issue.id));
+        assert!(!state.running.contains_key(&issue.id));
+        assert!(tokio::fs::metadata(&workspace_path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_worker_finished_schedules_expected_retry_paths() {
+        let issue = sample_issue("1", "ABC-1", "In Progress");
+        let mut state = test_state();
+        let (running, _) = running_runtime(issue.clone());
+        state.running.insert(issue.id.clone(), running);
+
+        handle_worker_finished(
+            &mut state,
+            crate::agent::WorkerOutcome {
+                issue: issue.clone(),
+                attempt: None,
+                workspace_path: PathBuf::from("/tmp/symphony/ABC-1"),
+                workspace_key: String::from("ABC-1"),
+                log_path: PathBuf::from("/tmp/symphony/.logs/latest.log"),
+                exit: WorkerExit::Succeeded,
+                error: None,
+                turn_count: 1,
+            },
+        )
+        .await;
+
+        assert!(state.completed.contains(&issue.id));
+        assert_eq!(state.retry_attempts[&issue.id].entry.attempt, 1);
+        assert!(state.retry_attempts[&issue.id].entry.error.is_none());
+
+        let mut timed_out_state = test_state();
+        let timed_out_issue = sample_issue("2", "ABC-2", "In Progress");
+        let (mut timed_out_running, _) = running_runtime(timed_out_issue.clone());
+        timed_out_running.entry.retry_attempt = Some(2);
+        timed_out_state
+            .running
+            .insert(timed_out_issue.id.clone(), timed_out_running);
+
+        handle_worker_finished(
+            &mut timed_out_state,
+            crate::agent::WorkerOutcome {
+                issue: timed_out_issue.clone(),
+                attempt: Some(2),
+                workspace_path: PathBuf::from("/tmp/symphony/ABC-2"),
+                workspace_key: String::from("ABC-2"),
+                log_path: PathBuf::from("/tmp/symphony/.logs/latest.log"),
+                exit: WorkerExit::TimedOut,
+                error: None,
+                turn_count: 1,
+            },
+        )
+        .await;
+
+        let retry = &timed_out_state.retry_attempts[&timed_out_issue.id].entry;
+        assert_eq!(retry.attempt, 3);
+        assert_eq!(retry.error.as_deref(), Some("worker turn timeout"));
+    }
+
+    #[tokio::test]
+    async fn handle_retry_due_releases_or_requeues_when_dispatch_is_not_possible() {
+        let missing_tracker = ControlledTracker::new(TrackerBehavior::default());
+        let mut missing_state = test_state_with_tracker(Arc::new(missing_tracker));
+        missing_state.claimed.insert(String::from("1"));
+        schedule_retry(&mut missing_state, "1", "ABC-1", 1, None, 1);
+        handle_retry_due(&mut missing_state, "1").await;
+        assert!(!missing_state.claimed.contains("1"));
+        assert!(!missing_state.retry_attempts.contains_key("1"));
+
+        let error_tracker = ControlledTracker::new(TrackerBehavior {
+            candidate_error: Some(String::from("network down")),
+            ..TrackerBehavior::default()
+        });
+        let mut error_state = test_state_with_tracker(Arc::new(error_tracker));
+        schedule_retry(&mut error_state, "2", "ABC-2", 2, None, 1);
+        handle_retry_due(&mut error_state, "2").await;
+        let error_retry = &error_state.retry_attempts["2"].entry;
+        assert_eq!(error_retry.attempt, 3);
+        assert!(
+            error_retry
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("retry poll failed")
+        );
+
+        let saturated_issue = sample_issue("3", "ABC-3", "Todo");
+        let saturated_tracker = ControlledTracker::new(TrackerBehavior {
+            candidates: vec![saturated_issue.clone()],
+            ..TrackerBehavior::default()
+        });
+        let mut saturated_state = test_state_with_tracker(Arc::new(saturated_tracker));
+        let (running, _) = running_runtime(sample_issue("4", "ABC-4", "In Progress"));
+        saturated_state.workflow.config.agent.max_concurrent_agents = 1;
+        saturated_state.running.insert(String::from("4"), running);
+        schedule_retry(&mut saturated_state, "3", "ABC-3", 1, None, 1);
+        handle_retry_due(&mut saturated_state, "3").await;
+        assert_eq!(saturated_state.retry_attempts["3"].entry.attempt, 2);
+        assert_eq!(
+            saturated_state.retry_attempts["3"].entry.error.as_deref(),
+            Some("no available orchestrator slots")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_and_publish_snapshots_include_running_and_retry_entries() {
+        let mut state = test_state();
+        let issue = sample_issue("1", "ABC-1", "In Progress");
+        let (mut running, _) = running_runtime(issue.clone());
+        running.entry.session.session_id = Some(String::from("thread-1-turn-1"));
+        running.entry.session.turn_count = 3;
+        running.entry.session.codex_input_tokens = 5;
+        running.entry.session.codex_output_tokens = 7;
+        running.entry.session.codex_total_tokens = 12;
+        running.entry.last_error = Some(String::from("boom"));
+        running.entry.log_path = Some(PathBuf::from("/tmp/symphony/.logs/latest.log"));
+        state.running.insert(issue.id.clone(), running);
+        schedule_retry(&mut state, "2", "ABC-2", 2, Some(String::from("retry")), 1);
+        state.codex_totals = CodexTotals {
+            input_tokens: 5,
+            output_tokens: 7,
+            total_tokens: 12,
+            seconds_running: 2.0,
+        };
+
+        let snapshot = build_runtime_snapshot(&state);
+        let issues = build_issue_debug_map(&state);
+        publish_snapshot(&state).await;
+        let published = state
+            .snapshot_store
+            .snapshot()
+            .await
+            .expect("snapshot should be published");
+
+        assert_eq!(snapshot.counts.running, 1);
+        assert_eq!(snapshot.counts.retrying, 1);
+        assert_eq!(published.counts.running, 1);
+        assert_eq!(snapshot.running[0].tokens.total_tokens, 12);
+        assert_eq!(issues["ABC-1"].status, "running");
+        assert_eq!(issues["ABC-2"].status, "retrying");
+        assert_eq!(issues["ABC-1"].logs.codex_session_logs[0].label, "latest");
+    }
+
+    #[tokio::test]
+    async fn reload_workflow_updates_state_and_keeps_last_good_runtime_on_error() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let workflow_path = tempdir.path().join("WORKFLOW.md");
+        unsafe {
+            std::env::set_var("LINEAR_API_KEY", "test-token");
+        }
+        tokio::fs::write(
+            &workflow_path,
+            "---\ntracker:\n  kind: linear\n  project_slug: proj\npolling:\n  interval_ms: 1234\n---\nhello",
+        )
+        .await
+        .expect("workflow should be written");
+
+        let mut state = test_state();
+        reload_workflow(&mut state, &workflow_path).await;
+        assert_eq!(state.workflow.config.polling.interval_ms, 1234);
+
+        tokio::fs::write(&workflow_path, "---\ntracker:\n  kind: [\n---\nhello")
+            .await
+            .expect("invalid workflow should be written");
+        reload_workflow(&mut state, &workflow_path).await;
+        assert_eq!(state.workflow.config.polling.interval_ms, 1234);
+    }
+
+    #[tokio::test]
+    async fn startup_terminal_workspace_cleanup_removes_terminal_workspaces() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let workspace_root = tempdir.path().join("workspaces");
+        let tracker = ControlledTracker::new(TrackerBehavior {
+            issues_by_states: vec![sample_issue("1", "ABC-1", "Done")],
+            ..TrackerBehavior::default()
+        });
+        let mut state = test_state_with_tracker(Arc::new(tracker));
+        state.workflow.config.workspace.root = workspace_root.clone();
+        tokio::fs::create_dir_all(workspace_root.join("ABC-1"))
+            .await
+            .expect("workspace should exist");
+
+        startup_terminal_workspace_cleanup(&state).await;
+
+        assert!(
+            tokio::fs::metadata(workspace_root.join("ABC-1"))
+                .await
+                .is_err()
+        );
     }
 }

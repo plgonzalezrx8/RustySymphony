@@ -1067,3 +1067,100 @@ fn extract_token_usage(value: &Value) -> Option<TokenUsage> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_linear_graphql_arguments_from_string_and_object() {
+        let (query, variables) = parse_linear_graphql_arguments(Some(&Value::String(
+            String::from("query One { viewer { id } }"),
+        )))
+        .expect("string arguments should parse");
+        assert_eq!(query, "query One { viewer { id } }");
+        assert!(variables.is_none());
+
+        let (query, variables) = parse_linear_graphql_arguments(Some(&serde_json::json!({
+            "query": "query One { viewer { id } }",
+            "variables": { "id": 1 }
+        })))
+        .expect("object arguments should parse");
+        assert_eq!(query, "query One { viewer { id } }");
+        assert_eq!(variables, Some(serde_json::json!({ "id": 1 })));
+    }
+
+    #[test]
+    fn rejects_invalid_linear_graphql_arguments() {
+        assert!(parse_linear_graphql_arguments(None).is_err());
+        assert!(parse_linear_graphql_arguments(Some(&serde_json::json!({ "query": "" }))).is_err());
+        assert!(
+            parse_linear_graphql_arguments(Some(&serde_json::json!({
+                "query": "query One { viewer { id } }",
+                "variables": ["not-an-object"]
+            })))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn extracts_strings_and_summaries_from_nested_payloads() {
+        let payload = serde_json::json!({
+            "result": {
+                "thread": { "id": "thread-1" },
+                "turn": { "id": "turn-1" },
+                "message": "done"
+            }
+        });
+
+        assert_eq!(
+            extract_string(&payload, &[&["result", "thread", "id"]]),
+            Some(String::from("thread-1"))
+        );
+        assert_eq!(
+            find_string(&payload, &["message", "text"]),
+            Some(String::from("done"))
+        );
+        assert_eq!(summarize_value(&Value::Null), None);
+        assert_eq!(
+            summarize_value(&serde_json::json!({ "summary": "short" })),
+            Some(String::from("short"))
+        );
+        assert!(
+            summarize_value(&Value::String("x".repeat(400)))
+                .unwrap_or_default()
+                .ends_with("...")
+        );
+    }
+
+    #[test]
+    fn extracts_nested_token_usage_variants() {
+        let tokens = extract_token_usage(&serde_json::json!({
+            "params": {
+                "total_token_usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 5,
+                    "total_tokens": 9
+                }
+            }
+        }))
+        .expect("snake_case tokens should parse");
+        assert_eq!(
+            tokens,
+            TokenUsage {
+                input_tokens: 4,
+                output_tokens: 5,
+                total_tokens: 9,
+            }
+        );
+
+        let tokens = extract_token_usage(&serde_json::json!({
+            "usage": {
+                "inputTokens": 6,
+                "outputTokens": 7
+            }
+        }))
+        .expect("camelCase tokens should parse");
+        assert_eq!(tokens.total_tokens, 13);
+    }
+}

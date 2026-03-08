@@ -40,10 +40,34 @@ jobs:
       - name: Run hermetic tests with coverage enforcement
         run: cargo llvm-cov --workspace --all-features --tests --locked --fail-under-lines 70
 
+  prepare-real-integration:
+    name: prepare-real-integration
+    runs-on: ubuntu-24.04
+    outputs:
+      can_run: ${{ steps.gate.outputs.can_run }}
+      project_slug: ${{ steps.gate.outputs.project_slug }}
+    steps:
+      - name: Decide whether live smoke tests can run
+        id: gate
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PROJECT_SLUG_FROM_VAR: ${{ vars.SYMPHONY_LINEAR_PROJECT_SLUG }}
+          PROJECT_SLUG_FROM_SECRET: ${{ secrets.SYMPHONY_LINEAR_PROJECT_SLUG }}
+        run: |
+          project_slug="${PROJECT_SLUG_FROM_VAR:-${PROJECT_SLUG_FROM_SECRET:-}}"
+          if [[ -n "${LINEAR_API_KEY}" && -n "${project_slug}" ]]; then
+            echo "can_run=true" >> "$GITHUB_OUTPUT"
+            echo "project_slug=${project_slug}" >> "$GITHUB_OUTPUT"
+          else
+            echo "can_run=false" >> "$GITHUB_OUTPUT"
+            echo "project_slug=" >> "$GITHUB_OUTPUT"
+          fi
+
   real-integration:
     name: real-integration
     runs-on: ubuntu-24.04
-    if: ${{ secrets.LINEAR_API_KEY != '' && (vars.SYMPHONY_LINEAR_PROJECT_SLUG != '' || secrets.SYMPHONY_LINEAR_PROJECT_SLUG != '') }}
+    needs: prepare-real-integration
+    if: ${{ needs.prepare-real-integration.outputs.can_run == 'true' }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
@@ -57,7 +81,7 @@ jobs:
       - name: Run the live Linear smoke test
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          SYMPHONY_LINEAR_PROJECT_SLUG: ${{ vars.SYMPHONY_LINEAR_PROJECT_SLUG || secrets.SYMPHONY_LINEAR_PROJECT_SLUG }}
+          SYMPHONY_LINEAR_PROJECT_SLUG: ${{ needs.prepare-real-integration.outputs.project_slug }}
           SYMPHONY_LINEAR_ENDPOINT: ${{ vars.SYMPHONY_LINEAR_ENDPOINT }}
         run: cargo test --locked --test real_integration live_linear_candidate_fetch_smoke -- --ignored --exact --nocapture
 
@@ -81,7 +105,8 @@ jobs:
   real-integration-skip:
     name: real-integration-skip
     runs-on: ubuntu-24.04
-    if: ${{ !(secrets.LINEAR_API_KEY != '' && (vars.SYMPHONY_LINEAR_PROJECT_SLUG != '' || secrets.SYMPHONY_LINEAR_PROJECT_SLUG != '')) }}
+    needs: prepare-real-integration
+    if: ${{ needs.prepare-real-integration.outputs.can_run != 'true' }}
     steps:
       - name: Explain why live smoke tests were skipped
         run: echo "::notice::Skipping live integration smoke tests because LINEAR_API_KEY or SYMPHONY_LINEAR_PROJECT_SLUG is not configured."
